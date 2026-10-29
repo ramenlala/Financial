@@ -1,563 +1,211 @@
 #!/usr/bin/env python3
 """
-Personal Finance Tracker for Telegram
-=====================================
-- Sends/receives messages via Telegram Bot.
-- Writes transactions to Google Sheets.
-- Stores the last processed Telegram update_id in the Config tab.
-- Uses GitHub Actions to poll every 5 minutes + manual trigger.
+Personal Finance Tracker: Telegram -> Google Sheets
+===================================================
+Runs once per GitHub Actions run (every 5 minutes + manual trigger):
+  1. Reads the last processed Telegram update_id from the "Config" tab.
+  2. Fetches new messages from Telegram (getUpdates).
+  3. Logs transactions / answers commands, replying in Telegram.
+  4. Saves the new last update_id, then exits.
 
-Works in two modes:
-  1. Bot mode (requires Telegram secrets) - normally used in GitHub Actions.
-  2. Demo mode (no Telegram secrets) - good for local testing / screenshots.
+Message formats:
+  12.50 lunch food        -> expense, description "lunch", category "food"
+  +3000 salary income     -> income
+  8 coffee                -> expense, category "Uncategorized"
+Commands: /today  /month  /undo  /help
 """
 
+import json
 import os
-import re
 import sys
-import time
-import tempfile
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import gspread
+import requests
 from google.oauth2.service_account import Credentials
-from dotenv import load_dotenv
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
 
 SG_TZ = ZoneInfo("Asia/Singapore")
 
+TRANSACTIONS_TAB = "Transactions"
 CONFIG_TAB = "Config"
-CONFIG_ROW = 2
-CONFIG_LAST_UPDATE_ID = "last_processed_update_id"
+HEADER = ["Date", "Time", "Type", "Amount", "Description", "Category", "Telegram Message ID"]
 
-# Transactions tab and column positions
-TRANSACTIONS_HEADER = [
-    "Date",
-    "Time",
-    "Type",
-    "Amount",
-    "Description",
-    "Category",
-    "Telegram Message ID",
-]
+# Words treated as a category when they are the LAST word of a message.
+KNOWN_CATEGORIES = {
+    "food", "income", "transport", "shopping", "bills", "health",
+    "entertainment", "groceries", "rent", "travel", "other", "salary",
+}
 
-# Telegram chat id is a security check: only this chat id may use the bot.
-TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "").strip()
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
-SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "").strip()
-SERVICE_ACCOUNT_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()
+HELP_TEXT = (
+    "How to log:\n"
+    "  12.50 lunch food  → expense\n"
+    "  +3000 salary income  → income\n"
+    "Commands: /today /month /undo"
+)
 
 
 # ---------------------------------------------------------------------------
-# Settings / environment
+# Settings
 # ---------------------------------------------------------------------------
 
-def load_settings():
-    """
-    Read required settings from the environment.
-    Returns:
-        str: path to a temporary JSON file containing the service account key.
-    """
-    load_dotenv()
-
-    required = {
-        "TELEGRAM_CHAT_ID": TELEGRAM_CHAT_ID,
-        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
-        "GOOGLE_SERVICE_ACCOUNT_JSON": SERVICE_ACCOUNT_JSON,
-        "SPREADSHEET_ID": SPREADSHEET_ID,
-    }
-
-    missing = [name for name, value in required.items() if not value]
+def get_settings():
+    names = ["TELEGRAM_BOT_TOKEN", "TELEGRAM_CHAT_ID", "GOOGLE_SERVICE_ACCOUNT_JSON", "SPREADSHEET_ID"]
+    settings = {n: os.getenv(n, "").strip() for n in names}
+    missing = [n for n, v in settings.items() if not v]
     if missing:
-        print(f"Missing required settings: {', '.join(missing)}", file=sys.stderr)
-        sys.exit(1)
-
-    # If the JSON is a string starting with '{', treat it as inline JSON
-    # and write it to a temporary file (needed by gspread).
-    if SERVICE_ACCOUNT_JSON.startswith("{"):
-        fd, tmp_path = tempfile.mkstemp(suffix=".json")
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            f.write(SERVICE_ACCOUNT_JSON)
-        return tmp_path
-
-    # Otherwise assume it is a path to an existing JSON key file.
-    return SERVICE_ACCOUNT_JSON
+        sys.exit(f"Missing GitHub secrets: {', '.join(missing)}")
+    return settings
 
 
 # ---------------------------------------------------------------------------
-# Google Sheets helpers
+# Google Sheets
 # ---------------------------------------------------------------------------
 
-def get_sheet_context(service_account_path, spreadsheet_id):
-    """
-    Open the Google Sheet, ensure Config and Transactions tabs exist.
-    """
-    creds = Credentials.from_service_account_file(
-        service_account_path,
-        scopes=[
-            "https://www.googleapis.com/auth/spreadsheets",
-            "https://www.googleapis.com/auth/drive",
-        ],
+def open_sheets(service_account_json, spreadsheet_id):
+    """Open the spreadsheet and make sure both tabs exist."""
+    try:
+        info = json.loads(service_account_json)
+    except json.JSONDecodeError:
+        sys.exit("GOOGLE_SERVICE_ACCOUNT_JSON is not valid JSON. Paste the whole key file contents.")
+
+    creds = Credentials.from_service_account_info(
+        info, scopes=["https://www.googleapis.com/auth/spreadsheets"]
     )
+    spreadsheet = gspread.authorize(creds).open_by_key(spreadsheet_id)
+    existing = {ws.title for ws in spreadsheet.worksheets()}
 
-    client = gspread.authorize(creds)
-    sheet = client.open_by_key(spreadsheet_id)
+    if TRANSACTIONS_TAB not in existing:
+        ws = spreadsheet.add_worksheet(title=TRANSACTIONS_TAB, rows=1000, cols=len(HEADER))
+        ws.append_row(HEADER)
+    if CONFIG_TAB not in existing:
+        ws = spreadsheet.add_worksheet(title=CONFIG_TAB, rows=10, cols=2)
+        ws.update(range_name="A1:B1", values=[["last_update_id", 0]])
 
-    # Ensure Config tab exists.
-    if CONFIG_TAB not in sheet.sheetnames:
-        sheet.add_worksheet(title=CONFIG_TAB, rows=1, cols=2)
-        sheet.update_cell(CONFIG_TAB, 1, 1, "last_processed_update_id")
-        sheet.update_cell(CONFIG_TAB, 1, 2, 0)
-
-    config_ws = sheet.worksheet(CONFIG_TAB)
-
-    # Ensure Transactions tab exists.
-    if "Transactions" not in sheet.sheetnames:
-        sheet.add_worksheet(title="Transactions", rows=1, cols=len(TRANSACTIONS_HEADER))
-        transactions_ws = sheet.worksheet("Transactions")
-        transactions_ws.update_row(1, TRANSACTIONS_HEADER)
-    else:
-        transactions_ws = sheet.worksheet("Transactions")
-
-    return sheet, config_ws, transactions_ws
+    return spreadsheet.worksheet(TRANSACTIONS_TAB), spreadsheet.worksheet(CONFIG_TAB)
 
 
 def read_last_update_id(config_ws):
-    """
-    Read the last_processed_update_id from the Config tab.
-    """
     try:
-        value = config_ws.cell(CONFIG_ROW, 2).value
-        return int(value)
+        return int(config_ws.acell("B1").value or 0)
     except (TypeError, ValueError):
         return 0
 
 
 def write_last_update_id(config_ws, update_id):
-    """
-    Save the last_processed_update_id to the Config tab.
-    """
-    config_ws.update_cell(CONFIG_ROW, 2, int(update_id))
-
-
-def create_row_values(message_id, parsed):
-    """
-    Build a row for the Transactions tab from parsed data.
-    """
-    amount = parsed["amount"]
-    if parsed["type"] == "expense":
-        amount_for_sheet = -abs(amount)
-        sheet_type = "Expense"
-    else:
-        amount_for_sheet = abs(amount)
-        sheet_type = "Income"
-
-    date_str = datetime.now(SG_TZ).strftime("%Y-%m-%d")
-    time_str = datetime.now(SG_TZ).strftime("%H:%M:%S")
-
-    return [
-        date_str,
-        time_str,
-        sheet_type,
-        amount_for_sheet,
-        parsed["description"],
-        parsed["category"],
-        message_id,
-    ]
-
-
-def append_transaction(transactions_ws, row_values):
-    """
-    Append a row to the Transactions tab.
-    """
-    transactions_ws.append_row(row_values)
+    config_ws.update(range_name="B1", values=[[int(update_id)]])
 
 
 # ---------------------------------------------------------------------------
-# Telegram helpers
+# Telegram
 # ---------------------------------------------------------------------------
 
-def get_bot(token):
-    """
-    Return a Telegram Bot instance.
-    """
-    from telegram import Bot
-    from telegram.error import TelegramError
+class Telegram:
+    def __init__(self, token):
+        self.base = f"https://api.telegram.org/bot{token}"
 
-    return Bot(token=token)
+    def get_updates(self, offset):
+        r = requests.get(
+            f"{self.base}/getUpdates",
+            params={"offset": offset, "timeout": 0, "allowed_updates": json.dumps(["message"])},
+            timeout=30,
+        )
+        data = r.json()
+        if not data.get("ok"):
+            sys.exit(f"Telegram error: {data.get('description')} (check TELEGRAM_BOT_TOKEN)")
+        return data["result"]
 
-
-def send_telegram_reply(bot, chat_id, text):
-    """
-    Send a message back to the user in Telegram.
-    """
-    try:
-        bot.send_message(chat_id=chat_id, text=text)
-    except Exception as e:
-        print(f"Failed to send Telegram reply: {e}", file=sys.stderr)
+    def reply(self, chat_id, text):
+        try:
+            requests.post(f"{self.base}/sendMessage", json={"chat_id": chat_id, "text": text}, timeout=30)
+        except requests.RequestException as e:
+            print(f"Could not send Telegram reply: {e}", file=sys.stderr)
 
 
 # ---------------------------------------------------------------------------
-# Message parsing
+# Parsing
 # ---------------------------------------------------------------------------
 
 def parse_message(text):
-    """
-    Parse a user message into a transaction.
-
-    Expected formats:
-      - "12.50 lunch food"      -> expense (signless amount is expense)
-      - "+3000 salary income"   -> income
-      - "-12.50 lunch food"     -> expense (explicit minus)
-
-    Returns:
-        dict or None if parsing failed.
-    """
-    text = text.strip()
-    if not text:
+    """Turn '12.50 lunch food' into a transaction dict, or None if invalid."""
+    parts = text.strip().split()
+    if not parts:
         return None
 
-    sign = None
-    amount_text = text
+    amount_text = parts[0].replace("$", "").replace(",", "")
+    tx_type = "Expense"
+    if amount_text.startswith("+"):
+        tx_type = "Income"
+        amount_text = amount_text[1:]
+    elif amount_text.startswith("-"):
+        amount_text = amount_text[1:]
 
-    if text.startswith("+"):
-        sign = "income"
-        amount_text = text[1:]
-    elif text.startswith("-"):
-        sign = "expense"
-        amount_text = text[1:]
-
-    # Known categories (you can add more).
-    known_categories = {
-        "food", "income", "transport", "shopping", "bills",
-        "health", "entertainment", "other", "uncategorized",
-    }
-
-    tokens = amount_text.split()
-    if not tokens:
-        return None
-
-    # If last token is a known category, treat it as the category.
-    if tokens[-1].lower() in known_categories:
-        category = tokens[-1].lower()
-        description = " ".join(tokens[:-1]).strip()
-    else:
-        category = "Uncategorized"
-        description = amount_text.strip()
-
-    # If description is empty after extracting category, use the category
-    # as the description.
-    if not description:
-        description = category
-        category = "Uncategorized"
-
-    amount = None
-    if is_number(description):
-        amount = float(description)
-    else:
-        return None
-
-    # Default type based on sign.
-    if sign == "income":
-        tx_type = "income"
-    elif sign == "expense":
-        tx_type = "expense"
-    else:
-        # No sign: amount is treated as expense.
-        tx_type = "expense"
-
-    return {
-        "type": tx_type,
-        "amount": amount,
-        "description": description,
-        "category": category,
-    }
-
-
-def is_number(s):
-    """
-    Return True if s is a valid number (int or float).
-    """
-    s = s.strip()
-    if not s:
-        return False
-    if s.count(".") > 1:
-        return False
     try:
-        float(s)
-        return True
+        amount = round(float(amount_text), 2)
     except ValueError:
-        return False
+        return None
+    if amount <= 0:
+        return None
+
+    words = parts[1:]
+    category = "Uncategorized"
+    if len(words) >= 2 and words[-1].lower() in KNOWN_CATEGORIES:
+        category = words.pop().lower()
+    elif len(words) >= 2:
+        # Last word is the category even if it's not in the known list.
+        category = words.pop().lower()
+    description = " ".join(words) or category
+
+    return {"type": tx_type, "amount": amount, "description": description, "category": category}
 
 
 # ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
-def handle_command(command, chat_id, transactions_ws):
-    """
-    Handle /today, /month, /undo.
-    """
-    command = command.strip().lower()
-
-    if command == "/today":
-        totals = calculate_totals(transactions_ws, "today")
-        reply = (
-            "📅 Today Totals\n"
-            f"💰 Income: ${totals['income_total']:,.2f}\n"
-            f"🧾 Expenses: ${totals['expense_total']:,.2f}\n"
-            f"⚖️ Balance: ${totals['balance']:,.2f}"
-        )
-        send_telegram_reply(chat_id, reply)
-
-    elif command == "/month":
-        totals = calculate_totals(transactions_ws, "month")
-        reply = (
-            "📆 Month Totals\n"
-            f"💰 Income: ${totals['income_total']:,.2f}\n"
-            f"🧾 Expenses: ${totals['expense_total']:,.2f}\n"
-            f"⚖️ Balance: ${totals['balance']:,.2f}"
-        )
-        send_telegram_reply(chat_id, reply)
-
-    elif command == "/undo":
-        deleted = undo_last_transaction(transactions_ws, chat_id)
-        if deleted:
-            send_telegram_reply(chat_id, "🗑️ Last entry deleted.")
-        else:
-            send_telegram_reply(chat_id, "⚠️ No entry found to undo.")
-
-    else:
-        send_telegram_reply(
-            chat_id,
-            "Commands: /today, /month, /undo",
-        )
-
-
-def calculate_totals(transactions_ws, period):
-    """
-    Calculate totals from the Transactions tab.
-    This is a simple version that sums all rows. You can extend this later
-    to filter by date if you want strict /today and /month behaviour.
-    """
-    rows = transactions_ws.get_all_values()
-
-    income = 0.0
-    expense = 0.0
-
-    for row in rows[1:]:
-        if len(row) < 4:
+def totals(transactions_ws, date_prefix):
+    """Sum income/expense for rows whose Date starts with date_prefix."""
+    income = expense = 0.0
+    for row in transactions_ws.get_all_values()[1:]:
+        if len(row) < 4 or not row[0].startswith(date_prefix):
             continue
-
-        type_text = row[2].lower() if row[2] else ""
-        amount_text = row[3]
-
         try:
-            amount = float(amount_text)
+            amount = float(str(row[3]).replace(",", ""))
         except ValueError:
             continue
-
-        if type_text == "income":
+        if row[2] == "Income":
             income += amount
-        elif type_text == "expense":
+        elif row[2] == "Expense":
             expense += amount
-
-    balance = income - expense
-
-    return {
-        "income_total": round(income, 2),
-        "expense_total": round(expense, 2),
-        "balance": round(balance, 2),
-    }
+    return income, expense
 
 
-def undo_last_transaction(transactions_ws, chat_id):
-    """
-    Delete the most recent transaction row that belongs to this chat.
-    The Telegram Message ID is stored in column G (index 6).
-    """
-    rows = transactions_ws.get_all_values()
+def handle_command(text, tg, chat_id, transactions_ws):
+    command = text.split()[0].split("@")[0].lower()
+    now = datetime.now(SG_TZ)
 
-    if not rows:
-        return False
-
-    # Search from the most recent row backwards.
-    for i in range(len(rows) - 1, -1, -1):
-        row = rows[i]
-        if len(row) > 6 and str(row[6]).strip() == str(chat_id):
-            sheet_row = i + 1  # convert to 1-based row number
-            transactions_ws.delete_rows(sheet_row)
-            return True
-
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Message handling
-# ---------------------------------------------------------------------------
-
-def process_message(bot, parsed, chat_id, message_id, transactions_ws):
-    """
-    Write a parsed message to Google Sheets and reply to the user.
-    """
-    row_values = create_row_values(message_id, parsed)
-    append_transaction(transactions_ws, row_values)
-
-    amount_text = f"-{abs(parsed['amount'])}" if parsed["type"] == "expense" else f"+{parsed['amount']}"
-    reply = (
-        f"✅ Logged: {amount_text} "
-        f"| {parsed['description']} "
-        f"| {parsed['category']}"
-    )
-    send_telegram_reply(bot, chat_id, reply)
-
-
-def handle_update(bot, update, chat_id, transactions_ws, config_ws, last_processed_id):
-    """
-    Process one Telegram update if it is a message from the allowed chat.
-    """
-    # Only act on message updates.
-    if not update.message:
-        return last_processed_id
-
-    try:
-        message = update.message
-        message_chat_id = message.chat.id
-    except Exception:
-        return last_processed_id
-
-    # Security: ignore messages from any chat other than the allowed one.
-    if chat_id != str(message_chat_id):
-        send_telegram_reply(
-            bot,
-            message_chat_id,
-            "This bot only accepts messages from your Telegram account.",
-        )
-        return last_processed_id
-
-    # Skip already processed updates.
-    if update.update_id <= last_processed_id:
-        return last_processed_id
-
-    # Handle commands.
-    text = message.text.strip() if message.text else ""
-    if text.startswith("/"):
-        handle_command(text, message_chat_id, transactions_ws)
-        return last_processed_id
-
-    # Parse normal message.
-    parsed = parse_message(text)
-    if parsed is None:
-        send_telegram_reply(
-            bot,
-            message_chat_id,
-            "⚠️ Could not understand that.\n"
-            "Try: '12.50 lunch food' or '+3000 salary income'",
-        )
-        return last_processed_id
-
-    # Save to sheet and reply.
-    process_message(bot, parsed, message_chat_id, message.message_id, transactions_ws)
-
-    # Update the last processed update id.
-    last_processed_id = update.update_id
-    write_last_update_id(config_ws, last_processed_id)
-
-    return last_processed_id
-
-
-def poll_telegram(bot, transactions_ws, config_ws, chat_id):
-    """
-    Poll Telegram for new updates every 5 minutes and process them.
-    """
-    last_processed_id = read_last_update_id(config_ws)
-
-    while True:
-        try:
-            # offset = last_processed_id + 1 means "only give me new updates".
-            updates = bot.get_updates(
-                offset=last_processed_id + 1,
-                timeout=60,
-                allowed_updates=["message"],
-            )
-        except Exception as e:
-            print(f"Telegram getUpdates error: {e}", file=sys.stderr)
-            last_processed_id = read_last_update_id(config_ws)
-            time.sleep(60)
-            continue
-
-        if not updates:
-            time.sleep(300)
-            continue
-
-        for update in updates:
-            last_processed_id = handle_update(
-                bot,
-                update,
-                chat_id,
-                transactions_ws,
-                config_ws,
-                last_processed_id,
-            )
-
-        # Save on exit from loop.
-        write_last_update_id(config_ws, last_processed_id)
-        time.sleep(300)
-
-
-# ---------------------------------------------------------------------------
-# Demo mode (for local testing without Telegram)
-# ---------------------------------------------------------------------------
-
-def demo_command_line_mode():
-    """
-    Allow the user to run simple commands locally without Telegram.
-    """
-    from io import StringIO
-
-    # Fake Telegram chat id for local demo.
-    DUMMY_CHAT_ID = 123456789
-
-    _, config_ws, transactions_ws = get_sheet_context(
-        load_settings(), SPREADSHEET_ID
-    )
-
-    print("Financial bot - demo mode")
-    print("Type your transactions or commands.")
-    print("Commands: /today, /month, /undo, /quit")
-    print("Example: 12.50 lunch food")
-    print("----------------------")
-
-    while True:
-        try:
-            user_input = input("You: ").strip()
-        except (EOFError, KeyboardInterrupt):
-            print("\nGoodbye!")
-            break
-
-        if user_input.lower() in ("/quit", "/exit"):
-            break
-
-        if not user_input:
-            continue
-
-        # Handle commands.
-        if user_input.lower().startswith("/"):
-            handle_command(user_input, DUMMY_CHAT_ID, transactions_ws)
-            continue
-
-        # Try to parse as normal transaction.
-        parsed = parse_message(user_input)
-        if parsed is None:
-            print("⚠️ Could not understand that. Try: '12.50 lunch food'")
-            continue
-
-        process_message(None, parsed, DUMMY_CHAT_ID, None, transactions_ws)
-        print("OK")
+    if command in ("/today", "/month"):
+        prefix = now.strftime("%Y-%m-%d") if command == "/today" else now.strftime("%Y-%m")
+        label = "Today" if command == "/today" else now.strftime("%B %Y")
+        income, expense = totals(transactions_ws, prefix)
+        bal = income - expense
+        bal_text = f"-${abs(bal):,.2f}" if bal < 0 else f"${bal:,.2f}"
+        tg.reply(chat_id, (
+            f"📅 {label}\n"
+            f"💰 Income: ${income:,.2f}\n"
+            f"🧾 Spent: ${expense:,.2f}\n"
+            f"⚖️ Balance: {bal_text}"
+        ))
+    elif command == "/undo":
+        rows = transactions_ws.get_all_values()
+        if len(rows) <= 1:
+            tg.reply(chat_id, "⚠️ Nothing to undo.")
+            return
+        last = rows[-1]
+        transactions_ws.delete_rows(len(rows))
+        tg.reply(chat_id, f"🗑️ Deleted: {last[2]} ${last[3]} | {last[4]} | {last[5]}")
+    else:
+        tg.reply(chat_id, HELP_TEXT)
 
 
 # ---------------------------------------------------------------------------
@@ -565,28 +213,44 @@ def demo_command_line_mode():
 # ---------------------------------------------------------------------------
 
 def main():
-    """
-    Entry point.
-    """
-    # If Telegram secrets are present, run the bot.
-    if TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID:
-        print("Starting finance bot (Telegram mode)...")
-        try:
-            _, config_ws, transactions_ws = get_sheet_context(
-                load_settings(), SPREADSHEET_ID
-            )
-            bot = get_bot(TELEGRAM_BOT_TOKEN)
-            poll_telegram(bot, transactions_ws, config_ws, TELEGRAM_CHAT_ID)
-        except Exception as e:
-            print(f"Bot failed: {e}", file=sys.stderr)
-            sys.exit(1)
+    s = get_settings()
+    tg = Telegram(s["TELEGRAM_BOT_TOKEN"])
+    transactions_ws, config_ws = open_sheets(s["GOOGLE_SERVICE_ACCOUNT_JSON"], s["SPREADSHEET_ID"])
 
-    else:
-        # No Telegram secrets -> run demo command line mode.
-        print("No Telegram secrets found. Running in demo mode.")
-        print("Add TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID to your .env or GitHub secrets.")
-        print("Run without Telegram to use the local demo below.\n")
-        demo_command_line_mode()
+    last_id = read_last_update_id(config_ws)
+    updates = tg.get_updates(offset=last_id + 1)
+    print(f"Last processed update: {last_id}. New updates: {len(updates)}")
+
+    for update in updates:
+        update_id = update["update_id"]
+        message = update.get("message") or {}
+        chat_id = message.get("chat", {}).get("id")
+        text = (message.get("text") or "").strip()
+
+        try:
+            if chat_id is None or not text:
+                pass
+            elif str(chat_id) != s["TELEGRAM_CHAT_ID"]:
+                print(f"Ignored message from unknown chat {chat_id}")
+            elif text.startswith("/"):
+                handle_command(text, tg, chat_id, transactions_ws)
+            else:
+                tx = parse_message(text)
+                if tx is None:
+                    tg.reply(chat_id, "⚠️ Couldn't read that.\n" + HELP_TEXT)
+                else:
+                    now = datetime.fromtimestamp(message.get("date", 0), SG_TZ)
+                    transactions_ws.append_row([
+                        now.strftime("%Y-%m-%d"), now.strftime("%H:%M:%S"), tx["type"],
+                        tx["amount"], tx["description"], tx["category"], message.get("message_id"),
+                    ], value_input_option="USER_ENTERED")
+                    sign = "+" if tx["type"] == "Income" else "-"
+                    tg.reply(chat_id, f"✅ Logged: {sign}${tx['amount']:,.2f} | {tx['description']} | {tx['category']}")
+        finally:
+            # Save progress after every message so nothing is logged twice.
+            write_last_update_id(config_ws, update_id)
+
+    print("Done.")
 
 
 if __name__ == "__main__":
